@@ -22,7 +22,7 @@ assets/
 /build/
 CMakeCache.txt
 CMakeFiles/
-Makefile
+/Makefile
 cmake_install.cmake
 *.elf
 *.velf
@@ -54,3 +54,6 @@ cmake-build-*/
 /decompiled/
 binds.bin
 report.txt
+
+# Capturas de consola (muestran el juego)
+screenshots/

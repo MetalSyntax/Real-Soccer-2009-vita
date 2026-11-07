@@ -1,47 +1,37 @@
-/**
- * @file imports.h
- * @brief Dynamic import table definitions and SoftFP calling conventions.
- */
 #pragma once
 #include <stdint.h>
 
-/**
- * @brief Represents a single imported symbol binding.
- */
 typedef struct {
-    const char *name; /**< Mach-O symbol name (including leading '_' if present). */
-    uintptr_t addr;   /**< Destination function address or data pointer. */
-    int data;         /**< 1 = variable/data (direct link); 0 = function (dispatched via ml_align_call). */
+    const char *name; // nombre Mach-O (con '_' inicial)
+    uintptr_t addr;
+    int data; // 1 = variable (se enlaza directo); 0 = función (entra por ml_align_call)
 } import_entry;
 
-/**
- * @brief Resolves an imported symbol by Mach-O name across all registered tables.
- * @param[in] name Symbol name string to locate.
- * @return Pointer to matching import_entry, or NULL if unhandled.
- */
+// Implementación de un import del juego, o NULL si no hay.
 const import_entry *imports_lookup(const char *name);
 
-// Modular subsystem symbol tables
-extern const import_entry darwin_imports[];
-extern const int darwin_imports_count;
+// Tablas por módulo (cada .c exporta la suya; imports.c las recorre en este orden).
+#define IMPORT_TABLE(t)                                                                                      \
+    extern const import_entry t##_imports[];                                                                 \
+    extern const int t##_imports_count;
+IMPORT_TABLE(patch)
+IMPORT_TABLE(darwin)
+IMPORT_TABLE(gles)
+IMPORT_TABLE(openal)
+IMPORT_TABLE(audio)
+IMPORT_TABLE(objc)
+IMPORT_TABLE(foundation)
+IMPORT_TABLE(uikit)
+IMPORT_TABLE(cxx)
+IMPORT_TABLE(ios5)
 
-extern const import_entry gles_imports[];
-extern const int gles_imports_count;
-
-extern const import_entry coreaudio_imports[];
-extern const int coreaudio_imports_count;
-
-extern const import_entry objc_imports[];
-extern const int objc_imports_count;
-
-extern const import_entry patch_imports[];
-extern const int patch_imports_count;
-
-// iOS ARM SoftFP calling convention: float and double arguments pass in integer registers (r0..r3).
-// Because VitaSDK targets hardfp by default, any imported function that passes or returns floats
-// must be decorated with this attribute.
+// La Vita es softfp como iOS: floats y doubles viajan en registros enteros en los dos lados, así
+// que las funciones con float de newlib/vitaGL se enlazan directo. Lo que NO coincide: Darwin no
+// alinea los int64/double a par de registros (r1:r2 es válido); esas firmas necesitan wrapper.
 #define SOFTFP __attribute__((pcs("aapcs")))
 
-#define F(name, fn)    {"_" #name, (uintptr_t)(fn), 0}
-#define F_RAW(name, fn){name, (uintptr_t)(fn), 0}
-#define D(name, addr)  {"_" #name, (uintptr_t)(addr), 1}
+// name sin el "_" que agrega Mach-O: F(__divsi3, fn) registra "___divsi3".
+#define F(name, fn) {"_" #name, (uintptr_t)(fn), 0}
+#define D(name) {"_" #name, (uintptr_t)(name), 0} // misma firma en newlib/vitaGL
+#define V(name, ptr) {"_" #name, (uintptr_t)(ptr), 1} // variable, no función
+#define TABLE_END(t) const int t##_imports_count = sizeof(t##_imports) / sizeof(t##_imports[0]);

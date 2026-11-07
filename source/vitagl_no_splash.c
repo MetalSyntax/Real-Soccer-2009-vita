@@ -1,7 +1,3 @@
-/**
- * @file vitagl_no_splash.c
- * @brief Overrides vitaGL default splashscreen routines to eliminate frame stalls.
- */
 #include <psp2/kernel/threadmgr.h>
 #include <stdint.h>
 

@@ -1,88 +1,45 @@
 #!/bin/sh
-# Prepara ux0_data/<slug>/ (= ux0:data/<slug>/ en la PS Vita) desde el app bundle (game_app).
-# Imita el sandbox de iOS para que las rutas del juego se resuelvan directamente:
-#   <AppName>.app/   bundle limpio (ejecutable + recursos), sin firmas de Apple ni basura
-#   rebase.bin       tabla de rebase generada por tools/macho_prep.py
-#   saves/           partidas (Documents/ de iOS); deploy nunca sobreescribe ni borra su contenido
-#   logs/            log_001.log .. log_999.log rotativos escritos por el loader
-#
-# Uso: tools/stage_data.sh [ruta/a/App.app]
-
+# Arma ux0_data/<slug>/ (= ux0:data/<slug>/ en la Vita) desde la .app del IPA, imitando el sandbox
+# de iOS:
+#   game_app/      el bundle (ejecutable + recursos), sin firma ni basura de macOS
+#   rebase.bin     palabras con direcciones absolutas  } tools/ios_prep.py (análisis del Mach-O)
+#   binds.bin      imports -> frameworks de Apple       }
+#   nib.txt        MainWindow.nib precompilado (tools/nib_prep.py), si el juego tiene nib
+#   controls.txt   botones -> toques (se crea con valores de ejemplo si no existe)
+#   Documents/     partidas (no se toca)      logs/  <slug>_NNN.log (los escribe el loader)
+# Además convierte la música .m4a/.mp3/.caf a .ogg (mismo nombre) para AudioFile (audio.c).
+# Nada de esto se commitea. Uso: tools/stage_data.sh [ruta/a/X.app]
 set -e
 cd "$(dirname "$0")/.."
-
+SLUG=$(sed -n 's/^#define PORT_SLUG "\(.*\)"/\1/p' source/port_config.h)
+EXEC=$(sed -n 's/^#define PORT_EXEC "\([^"]*\)".*/\1/p' source/port_config.h)
 APP="${1:-game_app}"
-if [ ! -d "$APP" ]; then
-    echo "[-] Error: No se encuentra el bundle en $APP (¿falta crear el symlink game_app?)"
-    exit 1
+OUT=ux0_data/$SLUG
+[ -f "$APP/$EXEC" ] || { echo "No encuentro $APP/$EXEC"; exit 1; }
+mkdir -p "$OUT/game_app" "$OUT/Documents" "$OUT/logs"
+rsync -a --delete --exclude '._*' --exclude '.DS_Store' --exclude '_CodeSignature' --exclude 'SC_Info' \
+  --exclude 'embedded.mobileprovision' --exclude 'CodeResources' --exclude 'iTunesMetadata.plist' \
+  --exclude '*.ogg.tmp' "$APP/" "$OUT/game_app/"
+python3 -I tools/ios_prep.py "$OUT/game_app/$EXEC" "$OUT" | head -12
+[ -f "$APP/MainWindow.nib" ] && python3 -I tools/nib_prep.py "$APP/MainWindow.nib" "$OUT/nib.txt" > /dev/null || rm -f "$OUT/nib.txt"
+# nibs de UIViewController (initWithNibName:): nibs/<nombre>.txt
+mkdir -p "$OUT/nibs"
+for n in "$APP"/*.nib; do
+  [ -f "$n" ] || continue
+  python3 -I tools/nib_prep.py "$n" "$OUT/nibs/$(basename "$n" .nib).txt" > /dev/null 2>&1 || echo "AVISO: nib $n sin convertir"
+done
+[ -f "$OUT/controls.txt" ] || cp tools/controls.example.txt "$OUT/controls.txt"
+# Música: AAC/MP3/CAF -> Ogg Vorbis (AudioFileOpenURL busca <nombre>.ogg)
+if command -v ffmpeg > /dev/null; then
+  find "$OUT/game_app" -type f ! -name '._*' \( -name '*.m4a' -o -name '*.mp3' -o -name '*.caf' -o -name '*.aac' \) | while read -r f; do
+    o="${f%.*}.ogg"
+    if [ ! -f "$o" ]; then
+      # encoder vorbis nativo de ffmpeg (el de Homebrew no trae libvorbis); solo estéreo
+      ffmpeg -nostdin -loglevel error -i "$f" -vn -ac 2 -c:a vorbis -strict -2 -q:a 5 -f ogg "$o.tmp" && mv "$o.tmp" "$o" \
+        || { rm -f "$o.tmp"; echo "AVISO: no se pudo convertir $f"; }
+    fi
+  done
+else
+  echo "AVISO: sin ffmpeg no hay música (.m4a -> .ogg)"
 fi
-
-# Detectar ejecutable e identificador desde Info.plist
-EXEC_NAME=$(python3 -c "
-import plistlib, sys
-try:
-    with open('$APP/Info.plist', 'rb') as f:
-        pl = plistlib.load(f)
-    print(pl.get('CFBundleExecutable', ''))
-except Exception:
-    print('')
-")
-
-if [ -z "$EXEC_NAME" ] || [ ! -f "$APP/$EXEC_NAME" ]; then
-    # Fallback: buscar el binario ejecutable más grande en la raíz del .app
-    EXEC_NAME=$(find "$APP" -maxdepth 1 -type f -perm +111 -exec ls -1S {} + 2>/dev/null | head -n 1 | xargs basename 2>/dev/null || echo "")
-fi
-
-if [ -z "$EXEC_NAME" ] || [ ! -f "$APP/$EXEC_NAME" ]; then
-    echo "[-] Error: No se pudo identificar el ejecutable Mach-O en $APP"
-    exit 1
-fi
-
-# Detectar slug
-SLUG=$(python3 -c "
-import json, re, os
-slug = ''
-if os.path.exists('.psvita-toolkit.json'):
-    try:
-        with open('.psvita-toolkit.json') as f:
-            slug = json.load(f).get('slug', '')
-    except Exception:
-        pass
-if not slug and os.path.exists('CMakeLists.txt'):
-    m = re.search(r'ux0:data/([^/]+)/?', open('CMakeLists.txt').read())
-    if m:
-        slug = m.group(1)
-print(slug or 'ios_game')
-")
-
-APP_DIR_NAME=$(basename "$APP")
-if [ "$APP_DIR_NAME" = "game_app" ]; then
-    # Usar el nombre real del .app al que apunta el symlink
-    REAL_APP_PATH=$(readlink "$APP" || echo "$APP")
-    APP_DIR_NAME=$(basename "$REAL_APP_PATH")
-fi
-
-OUT="ux0_data/$SLUG"
-echo "[*] Preparando datos para '$SLUG' desde '$APP/$EXEC_NAME'..."
-mkdir -p "$OUT/$APP_DIR_NAME" "$OUT/saves" "$OUT/logs" "docs"
-
-# Copiar recursos del bundle excluyendo firmas y metadatos innecesarios
-rsync -a --delete \
-  --exclude '._*' \
-  --exclude '.DS_Store' \
-  --exclude '_CodeSignature' \
-  --exclude 'SC_Info' \
-  --exclude 'embedded.mobileprovision' \
-  --exclude 'CodeResources' \
-  "$APP/" "$OUT/$APP_DIR_NAME/"
-
-# Generar rebase.bin y reporte de imports
-echo "[*] Analizando Mach-O y generando rebase.bin..."
-python3 -I tools/macho_prep.py "$OUT/$APP_DIR_NAME/$EXEC_NAME" "$OUT/rebase.bin" --report docs/macho_report.txt
-
-echo "[+] Staging completado en $OUT/"
-echo "    - $OUT/$APP_DIR_NAME/ ($EXEC_NAME y recursos)"
-echo "    - $OUT/rebase.bin"
-echo "    - $OUT/saves/ (directorio de guardado)"
-echo "    - $OUT/logs/ (directorio de logs)"
-echo "[+] Listo para desplegar con: python3 -I tools/deploy_data.py o 'psvita-toolkit deploy --data'"
+echo "Listo: $OUT (subir con: python3 -I tools/deploy_data.py)"

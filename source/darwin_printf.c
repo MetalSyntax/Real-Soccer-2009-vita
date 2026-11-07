@@ -1,22 +1,18 @@
-/**
- * @file darwin_printf.c
- * @brief Custom printf engine for the iOS ARMv6 variadic ABI.
- * @details In iOS ARMv6, variadic arguments are packed into 32-bit words WITHOUT 8-byte alignment:
- *          a double or long long occupies the next 2 consecutive words (even across r3 and stack).
- *          Standard newlib (AAPCS) forces 8-byte alignment and reads garbage. This implementation
- *          consumes arguments word-by-word, supporting %@ (NSString/CFString with C-string at +8)
- *          and unaligned double/long long arguments.
- *          Self-contained with no PS Vita dependencies (verified via tools/printf_check.py).
- */
+// printf con el ABI variádico de iOS ARMv6. Sin dependencias de la Vita: se prueba en el host
+// (tools/printf_check.py).
 #include <stdio.h>
 #include <string.h>
 
 #include "darwin_printf.h"
 
-// In iOS ARMv6, variadic arguments are packed into 32-bit words without 8-byte alignment:
-// a double or long long occupies the next 2 words. newlib (AAPCS) would align to 8 and read
-// garbage, so we iterate through the format consuming word by word.
-// p != NULL: Darwin va_list (pointer to words); otherwise variadic arguments of this call.
+// %@: texto de un objeto. foundation.c da la versión real (NSString, NSNumber, ...); esta es la del
+// host (tools/printf_check.py): la cadena C de un CFString está en +8.
+__attribute__((weak)) const char *objc_describe(void *o) { return *(const char **)((char *)o + 8); }
+
+// En iOS ARMv6 los argumentos variádicos son una secuencia de palabras de 32 bits SIN alinear: un
+// double/long long ocupa las 2 palabras siguientes (puede ser r3 + pila). newlib (AAPCS) los
+// alinearía a 8 y leería basura, así que se recorre el formato consumiendo palabra a palabra.
+// p != NULL: va_list de Darwin (puntero a las palabras); si no, los variádicos de esta llamada.
 static uint32_t word(words *w) { return w->p ? *w->p++ : va_arg(*w->ap, uint32_t); }
 static uint64_t dword(words *w) {
     uint32_t lo = word(w);
@@ -24,7 +20,7 @@ static uint64_t dword(words *w) {
 }
 
 int darwin_vformat(char *out, size_t size, const char *fmt, words *w) {
-    size_t n = 0; // total length, snprintf semantics (even if truncated)
+    size_t n = 0; // largo total, como snprintf (aunque no entre)
     char spec[40];
     while (*fmt) {
         if (*fmt != '%') {
@@ -38,7 +34,7 @@ int darwin_vformat(char *out, size_t size, const char *fmt, words *w) {
         spec[k++] = *fmt++;
         while (*fmt && strchr("-+ #0'", *fmt) && k < 8)
             spec[k++] = *fmt++;
-        for (int part = 0; part < 2; part++) { // width and precision
+        for (int part = 0; part < 2; part++) { // ancho y precisión
             if (part && *fmt == '.')
                 spec[k++] = *fmt++;
             else if (part)
@@ -71,9 +67,9 @@ int darwin_vformat(char *out, size_t size, const char *fmt, words *w) {
             union { uint64_t u; double d; } v = {dword(w)};
             spec[k++] = conv, spec[k] = 0;
             r = EMIT(v.d);
-        } else if (conv == 's' || conv == '@') { // %@: NSString/CFString, C string pointer at offset +8
+        } else if (conv == 's' || conv == '@') { // %@: NSString/CFString, la cadena C está en +8
             uint32_t v = word(w);
-            const char *s = !v ? "(null)" : conv == '@' ? *(const char **)(uintptr_t)(v + 8) : (const char *)(uintptr_t)v;
+            const char *s = !v ? "(null)" : conv == '@' ? objc_describe((void *)(uintptr_t)v) : (const char *)(uintptr_t)v;
             spec[k++] = 's', spec[k] = 0;
             r = EMIT(s);
         } else if (conv == 'p') {
@@ -81,7 +77,7 @@ int darwin_vformat(char *out, size_t size, const char *fmt, words *w) {
             r = EMIT((void *)(uintptr_t)word(w));
         } else if (conv == 'n') {
             word(w);
-        } else if (conv) { // %% and unknown conversion specifiers: emit literal
+        } else if (conv) { // %% y desconocidos: literal
             r = snprintf(dst, room, "%c", conv);
         }
 #undef EMIT
@@ -91,3 +87,4 @@ int darwin_vformat(char *out, size_t size, const char *fmt, words *w) {
         out[n < size ? n : size - 1] = 0;
     return n;
 }
+

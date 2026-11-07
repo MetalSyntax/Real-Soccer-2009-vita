@@ -1,16 +1,4 @@
-/**
- * @file patch.h
- * @brief Game-specific hooks, memory patches, and per-frame logic callbacks.
- */
 #pragma once
-#include "imports.h"
-
-/**
- * @brief Initializes game-specific memory patches, trampolines, and binary hooks.
- */
+// Parches propios del juego: imports que pisan a los genéricos (patch_imports) y hooks/parches de
+// __TEXT por dirección del Mach-O, antes de macho_finalize().
 void patch_init(void);
-
-/**
- * @brief Per-frame callback invoked from the main loop for custom game logic.
- */
-void patch_frame(void);

@@ -1,52 +1,29 @@
-/**
- * @file macho.h
- * @brief 32-bit Mach-O executable loader and runtime relocator for PS Vita.
- */
 #pragma once
 #include <stdint.h>
 
-/**
- * @brief Fixed virtual address offset where 32-bit iOS Mach-O binaries are loaded on PS Vita.
- * @details The original iOS executable is typically linked at base 0x1000.
- *          It is loaded shifted to an unused Vita user memory space:
- *          runtime_addr = original_addr + MACHO_SLIDE.
- *          Crash PC addresses can be translated directly by subtracting 0x98000000.
- */
+// El ejecutable de iOS se mapea en su vmaddr + MACHO_SLIDE. Un crash en PC = X se busca en el
+// Mach-O en X - MACHO_SLIDE (otool -tV / tools/annotate.py).
 #define MACHO_SLIDE 0x98000000u
 
-/**
- * @brief Loads a Mach-O executable, allocates memory blocks, and applies rebases.
- * @param[in] bin_path Path to Mach-O binary (thin or fat ARMv6/v7).
- * @param[in] rebase_path Path to offline rebase relocation table (rebase.bin).
- * @return 0 on success, negative error code on failure.
- */
-int macho_load(const char *bin_path, const char *rebase_path);
-
-/**
- * @brief Executes static C/C++ global constructors (__mod_init_func section).
- */
+// Carga el Mach-O (fino o universal) y aplica rebase.bin + binds.bin (tools/ios_prep.py).
+int macho_load(const char *bin_path, const char *rebase_path, const char *binds_path);
+// Copia __TEXT (ya parcheado) al bloque ejecutable. Llamar después de los hooks/parches.
+void macho_finalize(void);
 void macho_run_inits(void);
+void macho_write_word(uint32_t *addr, uint32_t v); // también en __TEXT (después de finalizar)
 
-/**
- * @brief Resolves the runtime memory address of a guest Mach-O symbol.
- * @param[in] name Mach-O symbol name (including leading '_' if present).
- * @return Runtime address (with Thumb bit 0 set if applicable), or 0 if not found.
- */
-uintptr_t macho_sym(const char *name);
+uintptr_t macho_sym(const char *name); // 0 si no está (binarios sin símbolos)
+uintptr_t macho_entry(void);           // LC_UNIXTHREAD pc (start), ya con slide
+int macho_section(const char *seg, const char *name, uint32_t *addr, uint32_t *size); // addr con slide
+int macho_patch_text(uint32_t vm, const void *data, uint32_t len); // vm sin slide
+uint32_t macho_read_text(uint32_t vm);
+void macho_hook_addr(uint32_t vm, void *dst); // vm sin slide (bit 0 = Thumb)
+int macho_hook(const char *name, void *dst);
+uintptr_t macho_thunk(uint32_t ip_value, void *jump);
+uintptr_t macho_resolve(const char *name, int is_lazy);
 
-/**
- * @brief Overwrites a guest function entry point with an unconditional trampoline hook.
- * @param[in] name Target guest symbol name.
- * @param[in] dst Destination hook function pointer.
- */
-void macho_hook(const char *name, void *dst);
-
-/**
- * @brief Invokes a guest function preserving r9 register.
- */
+// Llamadas al código del juego preservando r9 (temporal en Darwin).
 uint32_t call_guest(void *fn, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3);
-
-/**
- * @brief Invokes a 6-argument guest function preserving r9 register.
- */
 uint32_t call_guest6(void *fn, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5);
+
+static inline int is_guest_addr(uintptr_t a) { return a >= MACHO_SLIDE && a < MACHO_SLIDE + 0x08000000u; }

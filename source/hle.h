@@ -1,13 +1,10 @@
-/**
- * @file hle.h
- * @brief Canonical storage path constants for PS Vita high-level emulation.
- */
 #pragma once
+// Rutas en la Vita (sandbox de iOS) + configuración del port.
+#include "port_config.h"
 
 #ifndef DATA_PATH
-#define DATA_PATH "ux0:data/realsoccer09/"
+#define DATA_PATH "ux0:data/" PORT_SLUG "/"
 #endif
-
-#define BUNDLE_PATH DATA_PATH "game_app/"
-#define DOCS_PATH   DATA_PATH "saves/"
-#define LOGS_PATH   DATA_PATH "logs/"
+#define BUNDLE_PATH DATA_PATH "game_app/" // la .app del IPA (recursos + ejecutable)
+#define DOCS_PATH DATA_PATH "Documents/"  // NSDocumentDirectory (partidas guardadas)
+#define LOGS_PATH DATA_PATH "logs/"

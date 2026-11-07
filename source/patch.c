@@ -1,28 +1,13 @@
-/**
- * @file patch.c
- * @brief Game-specific hooks, memory patches, and custom symbol intercepts.
- */
-#include <stdio.h>
-#include <string.h>
-
+// Parches de este juego. Vacío hasta la primera corrida en consola: cada parche se agrega con
+// evidencia (log/dump + desensamblado con tools/annotate.py) y su dirección del Mach-O.
 #include "imports.h"
 #include "log.h"
 #include "macho.h"
 #include "patch.h"
 
-// Game-specific import tables for the port being developed.
-// Register any guest binary symbols you wish to intercept or replace here.
 const import_entry patch_imports[] = {
-    // Example:
-    // F(my_custom_function, my_implementation),
+    {"", 0, 0},
 };
-const int patch_imports_count = sizeof(patch_imports) / sizeof(patch_imports[0]);
+TABLE_END(patch)
 
-void patch_init(void) {
-    l_info("Initializing game-specific patches...");
-    // Place macho_hook(...) calls here to redirect internal guest functions
-}
-
-void patch_frame(void) {
-    // Per-frame logic if required by target engine
-}
+void patch_init(void) {}

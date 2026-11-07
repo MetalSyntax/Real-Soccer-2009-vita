@@ -1,73 +1,76 @@
-/**
- * @file log.c
- * @brief Thread-safe logging subsystem implementation.
- */
+#include <psp2/io/fcntl.h>
+#include <psp2/kernel/clib.h>
 #include <psp2/kernel/processmgr.h>
-#include <psp2/rtc.h>
+#include <psp2/kernel/threadmgr.h>
 #include <stdarg.h>
+#include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "log.h"
 
-static FILE *log_file = NULL;
+static SceUID log_fd = -1;
 
 void log_open(const char *path) {
-    if (log_file)
-        fclose(log_file);
-    log_file = fopen(path, "w");
-    if (!log_file)
-        printf("[-] Failed to open log file at %s\n", path);
+    log_fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
 }
 
-static void log_v(const char *level, const char *fmt, va_list ap) {
-    char buf[1024];
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+// Líneas idénticas seguidas (sin contar el timestamp) se aplanan: se reescribe la última línea con
+// " (xN)" en vez de agregar otra. El archivo siempre queda con el contador al día, aunque el
+// proceso muera en medio de la racha.
+static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
+static char last_body[1024];
+static unsigned long long last_ts;
+static int repeats;
+static SceOff last_off;
 
-    SceDateTime t;
-    sceRtcGetCurrentClockLocalTime(&t);
-    char time_str[32];
-    snprintf(time_str, sizeof(time_str), "%02d:%02d:%02d.%03d",
-             t.hour, t.minute, t.second, t.microsecond / 1000);
-
-    printf("[%s] [%s] %s\n", time_str, level, buf);
-    if (log_file) {
-        fprintf(log_file, "[%s] [%s] %s\n", time_str, level, buf);
-        fflush(log_file);
+static void vlog(const char *tag, const char *fmt, va_list ap) {
+    char body[1024], line[1100];
+    int n = snprintf(body, sizeof(body), "%s ", tag);
+    vsnprintf(body + n, sizeof(body) - n, fmt, ap);
+    pthread_mutex_lock(&log_lock);
+    if (repeats && !strcmp(body, last_body)) {
+        repeats++;
+        n = snprintf(line, sizeof(line), "[%llu] %s (x%d)\n", last_ts, body, repeats);
+        if (log_fd >= 0) {
+            sceIoLseek(log_fd, last_off, SCE_SEEK_SET);
+            sceIoWrite(log_fd, line, n);
+        }
+    } else {
+        repeats = 1;
+        last_ts = sceKernelGetProcessTimeWide() / 1000;
+        snprintf(last_body, sizeof(last_body), "%s", body);
+        n = snprintf(line, sizeof(line), "[%llu] %s\n", last_ts, body);
+        sceClibPrintf("%s", line);
+        // Sin buffer: cada línea llega al archivo aunque el proceso muera justo después.
+        if (log_fd >= 0) {
+            last_off = sceIoLseek(log_fd, 0, SCE_SEEK_END);
+            sceIoWrite(log_fd, line, n);
+        }
     }
+    pthread_mutex_unlock(&log_lock);
 }
 
 void l_info(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    log_v("INFO", fmt, ap);
-    va_end(ap);
-}
-
-void l_warn(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    log_v("WARN", fmt, ap);
+    vlog("I", fmt, ap);
     va_end(ap);
 }
 
 void l_error(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    log_v("ERROR", fmt, ap);
+    vlog("E", fmt, ap);
     va_end(ap);
 }
 
 void fatal_error(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
-    log_v("FATAL", fmt, ap);
+    vlog("FATAL", fmt, ap);
     va_end(ap);
-    if (log_file) {
-        fclose(log_file);
-        log_file = NULL;
-    }
-    sceKernelExitProcess(1);
+    sceKernelDelayThread(3 * 1000 * 1000);
+    sceKernelExitProcess(0);
     while (1) {}
 }

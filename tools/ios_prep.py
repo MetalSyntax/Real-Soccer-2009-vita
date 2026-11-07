@@ -30,6 +30,10 @@ LC_SEGMENT, LC_SYMTAB, LC_DYSYMTAB, LC_UNIXTHREAD = 0x1, 0x2, 0xB, 0x5
 LC_DYLD_INFO, LC_DYLD_INFO_ONLY, LC_MAIN = 0x22, 0x80000022, 0x80000028
 LC_FUNCTION_STARTS, LC_DATA_IN_CODE = 0x26, 0x29
 S_ZEROFILL, S_NON_LAZY, S_LAZY, S_STUBS, S_GB_ZEROFILL = 0x1, 0x6, 0x7, 0x8, 0xC
+NORETURN = {'__Unwind_SjLj_Resume', '___cxa_throw', '___cxa_rethrow', '_abort', '_exit', '___stack_chk_fail'}
+# registros que llevan un tamaño (nunca un puntero) en llamadas a estos imports
+SIZE_ARGS = {'__Znwm': (0,), '__Znam': (0,), '_malloc': (0,), '_calloc': (0, 1), '_realloc': (1,), '_bzero': (1,),
+             '_memset': (2,), '_memcpy': (2,), '_memmove': (2,), '_memcmp': (2,), '_strncpy': (2,), '_strncmp': (2,)}
 INDIRECT_LOCAL, INDIRECT_ABS = 0x80000000, 0x40000000
 N_STAB, N_TYPE, N_SECT = 0xE0, 0x0E, 0x0E
 N_ARM_THUMB_DEF = 0x0008
@@ -308,10 +312,12 @@ def classic_binds(m):
                 if idx & INDIRECT_ABS:
                     continue
                 binds.append(local_or_ext(m, idx, a, 0, t == S_LAZY))
-        elif t == S_STUBS and s['r2'] == 8:
-            # __symbol_stub4 (no PIC): ldr pc, [pc, #-4]; .long lazy_ptr
-            for j in range(s['size'] // 8):
-                rebases.add(s['addr'] + j * 8 + 4)
+        elif t == S_STUBS and s['r2'] in (8, 12):
+            # __symbol_stub4 (no PIC), 8: ldr pc, [pc, #-4]; .long lazy_ptr
+            #                          12: ldr ip, [pc]; ldr pc, [ip]; .long lazy_ptr
+            n = s['r2']
+            for j in range(s['size'] // n):
+                rebases.add(s['addr'] + j * n + n - 4)
     extreloff, nextrel, locreloff, nlocrel = m.dysym[14], m.dysym[15], m.dysym[16], m.dysym[17]
     for i in range(nextrel):
         addr, info = struct.unpack_from('<iI', d, extreloff + i * 8)
@@ -468,6 +474,10 @@ class CodeScan:
         self.funcs = set(known_funcs)
         self.jump_tables = set()
         self.ends = set()  # dirección siguiente a un salto incondicional (posible inicio de función)
+        self.bl_targets = set()
+        self.noreturn = set()  # stubs de funciones que no vuelven (lo que sigue al bl es otro bloque)
+        self.size_args = {}  # stub -> registros (0..3) que son tamaños
+        self.gl_stubs = set()  # stubs de _gl*: sus args son enums o punteros a datos, nunca a código
         self.todo = list(roots)
 
     def run(self):
@@ -488,8 +498,6 @@ class CodeScan:
                 if insn is None:
                     break
                 self.code.add(pc)
-                if insn.cc in (A.ARM_CC_AL, A.ARM_CC_INVALID):
-                    self.ends.add(pc + insn.size)
                 mn = insn.insn_name()
                 ops = insn.operands
                 nxt = pc + insn.size
@@ -543,7 +551,10 @@ class CodeScan:
                     tgt = ops[0].imm
                     mode = thumb ^ (1 if mn == 'blx' else 0)
                     self.funcs.add(tgt | mode)
+                    self.bl_targets.add(tgt & ~1)
                     self.todo.append(tgt | mode)
+                    if tgt in self.noreturn and not cond:
+                        break
                 elif mn in ('b', 'cbz', 'cbnz') and ops and ops[-1].type == A.ARM_OP_IMM:
                     self.todo.append(ops[-1].imm | thumb)
                     if mn == 'b' and not cond and not (thumb and insn.cc != A.ARM_CC_AL and insn.size == 2):
@@ -570,6 +581,11 @@ class CodeScan:
                 elif mn == 'tbb' or mn == 'tbh':
                     break  # Thumb-2: tablas relativas, no hacen falta rebases
                 pc = nxt
+            else:
+                continue
+            # cada break de arriba es un salto incondicional (b/bx/pop pc/ldr pc/...): lo que sigue puede ser función
+            if insn is not None:
+                self.ends.add(nxt)
 
     def _classify_use(self, md, start, reg, cc=None):
         """Mira las instrucciones siguientes: ¿el registro se usa como dirección o como número?"""
@@ -591,6 +607,11 @@ class CodeScan:
                     o.type == A.ARM_OP_REG and o.reg == reg for o in ops[1:]):
                 return 'mul'
             reads = [o for o in ops[1:] if o.type == A.ARM_OP_REG and o.reg == reg]
+            # PIC: add rX, pc, reg / ldr rX, [pc, reg] -> el literal es un desplazamiento, no puntero
+            if reads and any(o.type == A.ARM_OP_REG and o.reg == A.ARM_REG_PC for o in ops[1:]):
+                return 'pcrel'
+            if any(o.type == A.ARM_OP_MEM and o.mem.base == A.ARM_REG_PC and o.mem.index == reg for o in ops):
+                return 'pcrel'
             memuse = [o for o in ops if o.type == A.ARM_OP_MEM and (o.mem.base == reg)]
             if memuse:
                 return 'ptr'
@@ -608,6 +629,10 @@ class CodeScan:
             if mn == 'mov' and reads:
                 return 'move'
             if mn in ('bl', 'blx', 'b'):
+                if ops and ops[0].type == A.ARM_OP_IMM and reg - A.ARM_REG_R0 in self.size_args.get(ops[0].imm, ()):
+                    return 'size'
+                if ops and ops[0].type == A.ARM_OP_IMM and ops[0].imm in self.gl_stubs and reg <= A.ARM_REG_R3:
+                    return 'glarg'
                 return 'arg' if reg <= A.ARM_REG_R3 or reg in (A.ARM_REG_R0, A.ARM_REG_R1, A.ARM_REG_R2, A.ARM_REG_R3) else 'unknown'
             if ops and ops[0].type == A.ARM_OP_REG and ops[0].reg == reg and not mn.startswith(('str', 'cmp', 'tst')):
                 return 'dead'  # se sobrescribe sin leerse
@@ -628,7 +653,22 @@ def main():
     if m.dyldinfo and m.pie:
         rebases, binds = dyld_info_tables(m)
         rebases = sorted(set(rebases))
-        rep.append('modo: PIE/dyld_info (exacto)')
+        # binds (sobre todo weak) a símbolos que define el propio binario: van a esa definición
+        defined = {}
+        for name, typ, sect, desc, val in m.syms:
+            if not typ & N_STAB and (typ & N_TYPE) == N_SECT and (typ & 1):
+                defined.setdefault(name, val | (1 if desc & N_ARM_THUMB_DEF else 0))
+        nlocal = 0
+        for i, (a, add, lazy, name) in enumerate(binds):
+            if name in defined:
+                binds[i] = (a, defined[name] + add, lazy, '')
+                nlocal += 1
+        # varios binds al mismo slot (weak + regular): queda el último, como en dyld
+        last = {}
+        for b in binds:
+            last[b[0]] = b
+        binds = list(last.values())
+        rep.append('modo: PIE/dyld_info (exacto); %d binds resueltos dentro de la imagen' % nlocal)
     else:
         binds, exact = classic_binds(m)
         bound = {b[0] for b in binds}
@@ -660,6 +700,18 @@ def main():
             roots.add(m.entry)
         # punteros a código en datos (iteración: vtables, callbacks)
         scan = CodeScan(m, roots, known | set(imps))
+        for st in m.sects:
+            if st['flags'] & 0xFF == S_STUBS and st['r2']:
+                for j in range(st['size'] // st['r2']):
+                    idx = struct.unpack_from('<I', m.d, m.dysym[12] + (st['r1'] + j) * 4)[0]
+                    if not idx & (INDIRECT_LOCAL | INDIRECT_ABS):
+                        name = m.syms[idx][0]
+                        if name in NORETURN:
+                            scan.noreturn.add(st['addr'] + j * st['r2'])
+                        if name in SIZE_ARGS:
+                            scan.size_args[st['addr'] + j * st['r2']] = SIZE_ARGS[name]
+                        if name.startswith('_gl'):
+                            scan.gl_stubs.add(st['addr'] + j * st['r2'])
         scan.run()
 
         def in_text(v):
@@ -733,37 +785,83 @@ def main():
             scan.todo.extend(new)
             scan.run()
 
+        # Inicios de función "fuertes": símbolos, IMPs de ObjC, destinos de bl, prólogo ARM. Los
+        # "débiles" (instrucción tras un salto incondicional) solo cuentan con más evidencia.
+        strong = {v & ~1 for v in known} | {v & ~1 for v in imps} | scan.bl_targets
+
+        def is_strong(v):
+            return (v & ~1) in strong or prologue(v & ~1)
+
+        def is_weak(v):
+            return (v & ~1) in scan.ends and (v & ~1) in scan.code and (v & 0xFF) != 0 and (v & 0xFFF0) != 0
+
+        def in_ptr_sect(v):
+            return dlo <= v < dhi or v in cstarts or any(s['addr'] <= v < s['addr'] + s['size'] for s in tconst)
+
         heur = set()
         doubt = []
-        text_ptr_run = set()
-        # corridas de punteros a código (vtables)
+        # vtables: corrida >=2 de punteros a código (todos fuertes o débiles, al menos uno fuerte),
+        # precedida por la cabecera de vtable (0 / puntero a typeinfo) o compuesta solo de fuertes.
+        vt = set()
         run = []
         for a in data_words + [None]:
             v = m.u32(a) if a is not None else 0
-            if a is not None and in_text(v) and (v & 3) == 0 and (looks_func(v) or (v & ~1) in scan.code) and (not run or run[-1] == a - 4):
-                run.append(a)
+            ok = a is not None and in_text(v) and (v & 3) == 0 and (is_strong(v) or is_weak(v))
+            if ok and (not run or run[-1][0] == a - 4):
+                run.append((a, v))
                 continue
             if len(run) >= 2:
-                text_ptr_run.update(run)
-            run = [a] if a is not None and in_text(v) and (v & 3) == 0 and (looks_func(v) or (v & ~1) in scan.code) else []
+                head = m.u32(run[0][0] - 4)
+                header = head == 0 or in_ptr_sect(head)
+                n_strong = sum(1 for _, x in run if is_strong(x))
+                if n_strong == len(run) or (header and n_strong):
+                    vt.update(x for x, _ in run)
+            run = [(a, v)] if ok else []
         for a in data_words:
             v = m.u32(a)
             if v == 0 or not (m.lo <= v < m.hi):
                 continue
-            if dlo <= v < dhi:
+            if in_ptr_sect(v):
                 heur.add(a)
-            elif v in cstarts:
-                heur.add(a)
-            elif any(s['addr'] <= v < s['addr'] + s['size'] for s in tconst):
-                if v % 4 == 0:
-                    heur.add(a)
-                else:
-                    doubt.append(('data->tconst-unaligned', a, v))
             elif in_text(v):
-                if looks_func(v) or a in text_ptr_run:
+                if is_strong(v) or a in vt:
                     heur.add(a)
                 else:
                     doubt.append(('data->text-nofunc', a, v))
+            else:
+                doubt.append(('data->other', a, v))
+        # En constantes de __TEXT, vecino de un número (en rango pero descartado, o chico != 0) = tabla
+        # numérica: p. ej. order[] de zlib, halfwords 16,17 = 0x00110010 cae en __DATA. Solo __TEXT: en
+        # __DATA los structs mezclan punteros y números (validado con símbolos de HAWX).
+        # Con símbolos locales se juzga el objeto entero (lenfix/lbase de zlib: corridas sin vecino
+        # numérico): si alguna palabra es número, el resto también, salvo destinos a cadena o función.
+        numeric = {a for _, a, _ in doubt}
+        isnum = lambda n: n in numeric or 0 < m.u32(n) < 0x1000
+        tsecs = [(s['addr'], s['addr'] + s['size']) for s in tconst]
+        cuts = sorted({v & ~1 for n, typ, sect, desc, v in m.syms if not typ & N_STAB and (typ & N_TYPE) == N_SECT
+                       and any(lo <= v < hi for lo, hi in tsecs)} | {x for r in tsecs for x in r})
+        # Objeto que empieza desalineado (unsigned short lext[] de zlib) no puede ser tabla de punteros.
+        # Destino a función: puntero salvo que sea raro en un objeto numérico (<1/8 de sus palabras:
+        # lenfix tiene {16,7,10} = 0xa0710 = SoundEngineEffect::Start 3 veces en 512).
+        num_obj = {}
+        for a in sorted(heur):
+            if a in vt or not any(lo <= a < hi for lo, hi in tsecs):
+                continue
+            v = m.u32(a)
+            if v in cstarts:
+                continue
+            k = bisect.bisect_right(cuts, a)
+            lo, hi = cuts[k - 1], cuts[k] if k < len(cuts) else a + 4
+            if lo not in num_obj:
+                ws = range(lo & ~3, hi, 4)
+                nstrong = sum(1 for n in ws if n in heur and is_strong(m.u32(n)))
+                num_obj[lo] = (lo & 3 or any(isnum(n) for n in ws), nstrong * 8 >= len(ws))
+            numobj, dense = num_obj[lo]
+            if is_strong(v) and (dense or not numobj):
+                continue
+            if numobj or isnum(a - 4) or isnum(a + 4):
+                heur.discard(a)
+                doubt.append(('data->in-num-table', a, v))
         # literales del código
         lit_ptr = set()
         for lit, (use, ipc) in scan.literals.items():
@@ -773,10 +871,18 @@ def main():
             v = m.u32(lit)
             if not (m.lo <= v < m.hi) or v < 0x1000:
                 continue
+            if use == 'pcrel':
+                continue
+            if use == 'size':
+                doubt.append(('lit-size-arg', lit, v))
+                continue
+            if use == 'glarg' and in_text(v):
+                doubt.append(('lit-gl-enum', lit, v))  # p.ej. GL_TEXTURE_COORD_ARRAY 0x8078
+                continue
             if use in ('int', 'mul') and in_text(v):
                 doubt.append(('lit-int-use', lit, v))
                 continue
-            if dlo <= v < dhi or v in cstarts or any(s['addr'] <= v < s['addr'] + s['size'] for s in tconst):
+            if in_ptr_sect(v):
                 # fuera de __text un entero de >1 MB es raro: puntero salvo uso multiplicativo
                 # o valor impar que no es inicio de cadena
                 if use == 'mul' or (use == 'int' and v % 4 and v not in cstarts):
@@ -784,7 +890,8 @@ def main():
                 else:
                     lit_ptr.add(lit)
             elif in_text(v):
-                if looks_func(v) or prologue(v & ~1):
+                # función con evidencia fuerte, o débil usada como callback/puntero (no como número)
+                if is_strong(v) or (is_weak(v) and use in ('arg', 'store', 'move', 'ptr')):
                     lit_ptr.add(lit)
                 else:
                     doubt.append(('lit->text-nofunc', lit, v))
